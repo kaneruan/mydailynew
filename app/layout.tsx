@@ -10,6 +10,7 @@ import { createLogger } from "@/lib/logger"
 import Link from "next/link"
 import { Search } from "lucide-react"
 import SearchBar from "@/components/search-bar"
+import { Suspense } from "react"
 
 // 创建布局组件的日志记录器
 const logger = createLogger("RootLayout")
@@ -47,7 +48,9 @@ export default function RootLayout({
                 <Link href="/my-comments" className="font-medium">我的评论</Link>
               </nav>
             </div>
-            <SearchBar />
+            <Suspense fallback={<div className="w-64 h-10 bg-gray-200 rounded animate-pulse"></div>}>
+              <SearchBar />
+            </Suspense>
           </header>
           
           <div className="container mx-auto px-4 py-6">
