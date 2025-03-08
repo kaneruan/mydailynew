@@ -1,6 +1,7 @@
 import { sql } from "@vercel/postgres"
 import type { NewsItem, Article, Highlight, Comment } from "./types"
 import { createLogger } from "./logger"
+import { fetchRSSFeeds } from "./rss-fetcher"
 
 // 创建数据库模块的日志记录器
 const logger = createLogger("Database")
@@ -610,6 +611,214 @@ export async function getPaginatedArticles(
       total: 0,
       hasMore: false,
     }
+  }
+}
+
+// 获取文章列表（分页和搜索）
+export async function getArticles(page = 1, pageSize = 10, searchQuery?: string) {
+  logger.info(`Getting articles page=${page}, pageSize=${pageSize}, searchQuery=${searchQuery || 'none'}`)
+  
+  try {
+    const offset = (page - 1) * pageSize
+    
+    // 构建查询条件
+    let whereClause = ''
+    const params: any[] = []
+    
+    if (searchQuery && searchQuery.trim()) {
+      whereClause = `
+        WHERE 
+          title ILIKE $1 OR 
+          description ILIKE $1 OR 
+          content ILIKE $1
+      `
+      params.push(`%${searchQuery.trim()}%`)
+    }
+    
+    // 获取总数
+    const countResult = await sql.query(`
+      SELECT COUNT(*) as total 
+      FROM articles
+      ${whereClause}
+    `, params)
+    
+    const total = parseInt(countResult.rows[0].total)
+    
+    // 获取分页数据
+    const queryParams = [...params, pageSize, offset]
+    const result = await sql.query(`
+      SELECT * FROM articles 
+      ${whereClause}
+      ORDER BY pub_date DESC 
+      LIMIT $${params.length + 1} 
+      OFFSET $${params.length + 2}
+    `, queryParams)
+    
+    const hasMore = total > offset + result.rows.length
+    
+    // 转换数据格式
+    const items = result.rows.map(row => ({
+      id: row.id,
+      title: row.title,
+      description: row.description,
+      content: row.content,
+      link: row.link,
+      pubDate: row.pub_date,
+      source: row.source
+    }))
+    
+    logger.info(`Retrieved ${items.length} articles, total=${total}, hasMore=${hasMore}`)
+    
+    return {
+      items,
+      total,
+      hasMore
+    }
+  } catch (error) {
+    logger.error("Error getting articles:", error)
+    return { items: [], total: 0, hasMore: false }
+  }
+}
+
+// 获取所有评论
+export async function getAllComments() {
+  logger.info("Getting all comments")
+  
+  try {
+    const result = await sql`
+      SELECT c.*, a.title as article_title, a.source as article_source
+      FROM comments c
+      JOIN articles a ON c.article_id = a.id
+      ORDER BY c.created_at DESC
+    `
+    
+    const comments = result.rows.map(row => ({
+      id: row.id,
+      articleId: row.article_id,
+      content: row.content,
+      userName: row.user_name,
+      createdAt: row.created_at,
+      articleTitle: row.article_title,
+      articleSource: row.article_source
+    }))
+    
+    logger.info(`Retrieved ${comments.length} total comments`)
+    return comments
+  } catch (error) {
+    logger.error("Error getting all comments:", error)
+    return []
+  }
+}
+
+// 获取所有划线
+export async function getAllHighlights() {
+  logger.info("Getting all highlights")
+  
+  try {
+    const result = await sql`
+      SELECT h.*, a.title as article_title, a.source as article_source
+      FROM highlights h
+      JOIN articles a ON h.article_id = a.id
+      ORDER BY h.created_at DESC
+    `
+    
+    const highlights = result.rows.map(row => ({
+      id: row.id,
+      articleId: row.article_id,
+      text: row.text,
+      comment: row.comment,
+      createdAt: row.created_at,
+      articleTitle: row.article_title,
+      articleSource: row.article_source
+    }))
+    
+    logger.info(`Retrieved ${highlights.length} total highlights`)
+    return highlights
+  } catch (error) {
+    logger.error("Error getting all highlights:", error)
+    return []
+  }
+}
+
+// 从 RSS 获取文章并保存到数据库
+export async function fetchAndSaveArticles() {
+  logger.info("Fetching and saving articles from RSS")
+  
+  try {
+    // 获取 RSS 内容
+    const { items, hasErrors } = await fetchRSSFeeds()
+    
+    if (items.length === 0) {
+      if (hasErrors) {
+        logger.warn("No articles fetched due to RSS connection errors")
+        return { success: false, message: "无法连接到 RSS 源，请稍后再试" }
+      } else {
+        logger.info("No new articles found in RSS feeds")
+        return { success: true, message: "没有找到新文章" }
+      }
+    }
+    
+    // 保存文章到数据库
+    let savedCount = 0
+    for (const item of items) {
+      try {
+        await saveArticle(item)
+        savedCount++
+      } catch (error) {
+        logger.error(`Error saving article ${item.title}:`, error)
+      }
+    }
+    
+    logger.info(`Saved ${savedCount} articles to database`)
+    return { 
+      success: true, 
+      message: `成功保存了 ${savedCount} 篇文章`,
+      hasErrors
+    }
+  } catch (error) {
+    logger.error("Error in fetchAndSaveArticles:", error)
+    return { success: false, message: "获取文章失败" }
+  }
+}
+
+// 检查 RSS 源状态
+export async function checkRSSStatus() {
+  logger.info("Checking RSS status")
+  
+  try {
+    // 查询缓存表中的 RSS 状态
+    const result = await sql`
+      SELECT value FROM cache 
+      WHERE key = 'rss_status'
+      AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+    `
+    
+    if (result.rows.length > 0) {
+      logger.info("Found cached RSS status")
+      return result.rows[0].value
+    }
+    
+    // 如果没有缓存，尝试获取 RSS 源
+    logger.info("No cached RSS status, fetching RSS feeds")
+    const { hasErrors, errors } = await fetchRSSFeeds()
+    
+    // 保存状态到缓存表
+    const status = { hasErrors, errors }
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15分钟后过期
+    const expiresAtStr = expiresAt.toISOString() // 将 Date 转换为 ISO 字符串
+    
+    await sql`
+      INSERT INTO cache (key, value, expires_at)
+      VALUES ('rss_status', ${JSON.stringify(status)}, ${expiresAtStr})
+      ON CONFLICT (key) 
+      DO UPDATE SET value = ${JSON.stringify(status)}, expires_at = ${expiresAtStr}
+    `
+    
+    logger.info(`RSS status checked and cached: hasErrors=${hasErrors}`)
+    return status
+  } catch (error) {
+    logger.error("Error checking RSS status:", error)
+    return { hasErrors: true, error: "Failed to check RSS status" }
   }
 }
 

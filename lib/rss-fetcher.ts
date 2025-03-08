@@ -1,6 +1,8 @@
 import type { NewsItem } from "./types"
 import { saveArticle } from "./db"
 import { createLogger } from "./logger"
+import { generateId } from "@/lib/utils"
+import Parser from "rss-parser"
 
 // 创建 RSS 获取器模块的日志记录器
 const logger = createLogger("RSSFetcher")
@@ -58,57 +60,67 @@ const HUXIU_FALLBACK = [
   }
 ];
 
-// 修改 fetchWithTimeout 函数，增加更多的错误处理和重试机制
-async function fetchWithTimeout(url: string, timeout = 10000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeout);
-  
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/rss+xml, application/xml, text/xml, application/atom+xml, text/html',
-        'Cache-Control': 'no-cache'
-      }
-    });
-    clearTimeout(id);
-    return response;
-  } catch (error) {
-    clearTimeout(id);
-    throw error;
-  }
-}
+// 创建 RSS 解析器
+const parser = new Parser({
+  timeout: 10000, // 增加超时时间到 10 秒
+  headers: {
+    "User-Agent": "Mozilla/5.0 (compatible; NewsReader/1.0)",
+    "Accept": "application/rss+xml",
+  },
+})
 
-// 获取 RSS 内容的函数
-export async function fetchRSS(source: RSSSource) {
-  logger.info(`Fetching RSS from ${source.name}`)
+// 获取 RSS 内容
+export async function fetchRSSFeeds() {
+  logger.info("Fetching RSS feeds")
   
-  // 尝试所有可能的 URL
-  const urlsToTry = [source.url, source.fallbackUrl, ...(source.alternateUrls || [])];
+  const allItems = []
+  const errors = []
   
-  for (const url of urlsToTry) {
-    try {
-      logger.debug(`Trying URL for ${source.name}: ${url}`)
-      const response = await fetchWithTimeout(url, 8000);
-      
-      if (!response.ok) {
-        logger.warn(`Non-OK response from ${url}: ${response.status}`)
-        continue;
+  // 并行获取所有 RSS 源
+  const results = await Promise.allSettled(
+    RSS_SOURCES.map(async (source) => {
+      try {
+        logger.info(`Fetching RSS from ${source.name} (${source.url})`)
+        const feed = await parser.parseURL(source.url)
+        
+        // 处理获取到的文章
+        const items = feed.items.map((item) => ({
+          id: generateId("article_"),
+          title: item.title || "无标题",
+          description: item.contentSnippet || item.summary || "无描述",
+          content: item.content || item.description || item.summary || "",
+          link: item.link || "",
+          pubDate: item.pubDate ? new Date(item.pubDate) : new Date(),
+          source: source.name,
+        }))
+        
+        logger.info(`Retrieved ${items.length} items from ${source.name}`)
+        return { source: source.name, items }
+      } catch (error) {
+        logger.error(`Error fetching RSS from ${source.name}:`, error)
+        errors.push({ source: source.name, error: error.message })
+        return { source: source.name, items: [] }
       }
-      
-      const text = await response.text();
-      logger.info(`Successfully fetched RSS from ${url} for ${source.name}`)
-      return { text, source: source.name };
-    } catch (error) {
-      logger.error(`Error fetching from URL ${url} for ${source.name}: ${error instanceof Error ? error.message : String(error)}`)
-      // 继续尝试下一个 URL
-    }
-  }
+    })
+  )
   
-  // 所有 URL 都失败了
-  logger.error(`All URLs failed for ${source.name}`)
-  return null;
+  // 处理结果
+  results.forEach((result) => {
+    if (result.status === "fulfilled") {
+      allItems.push(...result.value.items)
+    }
+  })
+  
+  // 按发布日期排序（最新的在前）
+  allItems.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime())
+  
+  logger.info(`Total RSS items fetched: ${allItems.length}, Errors: ${errors.length}`)
+  
+  return {
+    items: allItems,
+    errors: errors,
+    hasErrors: errors.length > 0,
+  }
 }
 
 // 使用模拟数据，当所有 RSS 源都无法访问时使用
@@ -156,8 +168,14 @@ export async function fetchAndStoreRSS() {
 
           try {
             logger.debug(`Trying URL for ${source.name}: ${url}`)
-            const response = await fetchWithTimeout(url, 15000) // 增加超时时间
-
+            const response = await fetch(url, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'application/rss+xml, application/xml, text/xml, application/atom+xml, text/html',
+                'Cache-Control': 'no-cache'
+              }
+            });
+            
             if (response.ok) {
               xml = await response.text()
               successUrl = url
